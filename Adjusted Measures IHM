@@ -1,0 +1,530 @@
+import itertools
+import logging
+import gower
+import collections
+import numpy as np
+import pandas as pd
+import sklearn.datasets
+import matplotlib
+import matplotlib.pyplot as plt
+import seaborn as sns
+import sklearn.datasets
+import math
+import scipy.stats as stats
+
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.stats import iqr
+from sklearn import tree
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import DistanceMetric
+from sklearn.model_selection import GridSearchCV
+from sklearn.naive_bayes import GaussianNB
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
+from abc import ABC, abstractmethod
+from sklearn.datasets import make_blobs
+
+
+###################################################################################################################################
+
+class Measures(ABC):
+    """
+    Base class for measures (aka meta-features). Each measure should be implemented as a separate method.
+    """
+
+    _measures_dict: dict
+
+    @property
+    def logger(self):
+        raise NotImplementedError
+
+    def _call_method(self, name, **kwargs):
+        return getattr(self, name)(**kwargs)
+
+    def calculate_all(self, measures_list=None):
+        if measures_list is None:
+            measures_list = self._measures_dict.keys()
+        elif isinstance(measures_list, list):
+            measures_list = sorted(list(set(measures_list) & set(self._measures_dict.keys())))
+        else:
+            raise TypeError(f"Expected type list for parameter 'measures_list', not '{type(measures_list)}'")
+
+        results = collections.OrderedDict()
+        for k in measures_list:
+            self.logger.info(f"Calculating measure {repr(k)}")
+            results[k] = self._call_method(self._measures_dict[k])
+
+        df_measures = pd.DataFrame(results)
+        return df_measures.add_prefix('feature_')
+
+###################################################################################################################################
+
+def minmax(f: np.ndarray, y: np.ndarray) -> float:
+    r"""
+    For binary classes, calculates :math:`\min \max (f_i) = \min ( \max (f^{c_1}_i), \max (f^{c_2}_i) )`, where
+    :math:`f^{c_j}_i` is the i-th feature values for members of class :math:`c_j`.
+
+    Args:
+        f (array-like): i-th feature vector
+        y (array-like): corresponding class vector
+
+    Returns:
+        float: minmax value
+
+    Raises:
+        AssertionError: If classes are not binary
+
+    """
+    classes = np.unique(y)
+    assert len(classes) == 2
+    c1 = classes[0]
+    c2 = classes[1]
+    return min(np.max(f[y == c1]), np.max(f[y == c2]))
+
+def maxmin(f: np.ndarray, y: np.ndarray):
+    r"""
+    For binary classes, calculates :math:`\max \min (f_i) = \max ( \min (f^{c_1}_i), \min (f^{c_2}_i) )`, where
+    :math:`f^{c_j}_i` is the i-th feature values for members of class :math:`c_j`.
+
+    Args:
+        f (array-like): i-th feature vector
+        y (array-like): corresponding class vector
+
+    Returns:
+        float: maxmin value
+
+    Raises:
+        AssertionError: If classes are not binary
+
+    """
+    classes = np.unique(y)
+    assert len(classes) == 2
+    c1 = classes[0]
+    c2 = classes[1]
+    return max(np.min(f[y == c1]), np.min(f[y == c2]))
+
+###################################################################################################################################
+
+class ClassificationMeasures(Measures):
+    """
+    Hardness measures for classification. It provides separate methods to compute each measure.
+
+    Args:
+        data (pd.DataFrame): a dataframe where each line is an instace and columns are features. One column should
+            contain the labels. The name of the column with labels can be set with parameter `labels_col`
+        target_col (str): name of the column that contains the labels of the instances (default None - uses the
+            last column)
+        ccp_alpha (float): pruning parameter for pruned tree measures. If none is passed, then it attempts to tune
+            it automatically
+    """
+
+    _measures_dict = {
+        'kDNadj': 'k_disagreeing_neighbors_adjusted',
+        'CLDadj': 'class_likeliood_diff_adjusted',
+        'DCPadj': 'disjunct_class_percentage_adjusted',
+        'TD_Padj': 'tree_depth_pruned_adjusted',
+        'TD_Uadj': 'tree_depth_unpruned_adjusted',
+        'N2adj': 'intra_extra_ratio_adjusted'
+    }
+
+    logger = logging.getLogger(__name__)
+
+    def __init__(self, data: pd.DataFrame, target_col=None, ccp_alpha=None):
+        if target_col is None:
+            self.target_col = data.columns[-1]
+            self.y = data.iloc[:, -1]
+        else:
+            self.target_col = target_col
+            self.y = data[target_col]
+        self.data = data.reset_index(drop=True)
+        self.X = data.drop(columns=self.target_col)
+        self.N = len(data)
+
+        seed = np.random.seed(55)
+
+        # Gower distance matrix
+        self.dist_matrix_gower = gower.gower_matrix(self.X.values.copy())
+        #self.dist_matrix_gower = gower_distance(self.X)
+        delta = np.diag(-np.ones(self.dist_matrix_gower.shape[0]))
+        self.indices_gower = np.argsort(self.dist_matrix_gower + delta, axis=1)
+        self.distances_gower = np.sort(self.dist_matrix_gower, axis=1)
+
+        self.dot = None
+
+        # Naive Bayes classifier
+        n_c = self.y.nunique()
+        priors = np.ones((n_c,)) / n_c
+
+        nb = GaussianNB()#priors=priors
+        self.calibrated_nb = CalibratedClassifierCV(
+            estimator=nb,
+            method='sigmoid',
+            cv=3,
+            ensemble=False,
+            n_jobs=-1
+        )
+        self.calibrated_nb.fit(self.X, self.y)
+
+###################################################################################################################################
+
+    def k_disagreeing_neighbors_adjusted(self, k: int = 10, distance: str = 'gower') -> np.ndarray:
+        r"""
+        k-Disagreeing Neighbors Adjusted (kDNadj) gives the percentage of the :math:`k` nearest neighbors of :math:`\\mathbf x_i`
+        which do not share its label.
+
+        .. math::
+
+            kDNadj(\mathbf{x_i}) = \frac{ \sharp \{\mathbf x_j | \mathbf x_j \in kNN(\mathbf x_i) \wedge y_j
+            \neq y_i\}}{k}
+
+        Args:
+            k (int): number of neighbors
+            distance (str): distance metric (default 'gower')
+
+        Returns:
+            array-like: :math:`kDNadj(\mathbf x_i)`
+        """
+        data = self.data.copy()
+        if distance == 'gower':
+            indices = self.indices_gower[:, :k + 1]
+        else:
+            nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm='auto').fit(self.X)
+            distances, indices = nbrs.kneighbors(self.X)
+
+        unique_values = pd.unique(data[self.target_col])
+        C = [[] for _ in unique_values]
+        vl_unico = sorted(unique_values.tolist())
+
+        for j in vl_unico:
+          for i in range(0, len(data)):
+              v = data.loc[indices[i]][self.target_col].values
+              #v[i] = None
+              C[j].append(np.sum(v[1:] == vl_unico[j]) / k)
+
+        kDNadj = []
+        for i in range(len(C[0])):
+          entropy = 0.0
+          p = [c[i] for c in C]
+          entropy -= sum(p * math.log2(p) if p > 0 else 0 for p in p)
+          kDNadj.append(entropy)
+
+        return kDNadj
+
+###################################################################################################################################
+
+    def intra_extra_ratio_adjusted(self, distance='gower') -> np.ndarray:
+        r"""
+        Ratio of the intra-class and extra-class distances (N2): first the ratio of the distance of :math:`\mathbf x_i`
+        to the nearest example from its class to the distance it has to the nearest instance from a different class
+        (aka nearest enemy) is computed:
+
+        .. math::
+
+            IntraInter(\mathbf x_i) = \frac{d(\mathbf x_i,NN(\mathbf x_i) \in y_i)}{d(\mathbf x_i, ne(\mathbf x_i))}
+
+        where :math:`NN(\mathbf x_i)` represents a nearest neighbor of :math:`\mathbf x_i` and :math:`ne(\mathbf x_i)`
+        is the nearest enemy of :math:`\mathbf x_i`:
+
+        .. math::
+
+            ne(\mathbf x_i) = NN(\mathbf x_i) \in y_j \neq y_i
+
+        Then :math:`N_2` is taken as:
+
+        .. math::
+
+            N_2(\mathbf x_i) = 1 - \frac{1}{IntraInter(\mathbf x_i) + 1}
+
+        Larger values of :math:`N2(\mathbf x_i)` indicate that the instance :math:`\mathbf x_i` is closer to an example
+        from another class than to an example from its own class and is, therefore, harder to classify.
+
+        Args:
+            distance (str): the distance metric to use (default `'gower'`). See `this link
+                <https://scikit-learn.org/stable/modules/generated/sklearn.neighbors.DistanceMetric.html
+                #sklearn.neighbors.DistanceMetric>`_ for a list of available metrics.
+
+        Returns:
+            array-like: :math:`N_2(\mathbf x_i)`
+        """
+        y = self.y.copy()
+
+        if distance == 'gower':
+            indices = self.indices_gower
+            distances = self.distances_gower
+        else:
+            nbrs = NearestNeighbors(n_neighbors=len(self.y), algorithm='auto', metric=distance).fit(self.X)
+            distances, indices = nbrs.kneighbors(self.X)
+
+        N2 = np.zeros(y.values.shape)
+        for i, label in y.items():
+            nn = y.loc[indices[i, :]]
+            nn1 = nn.iloc[1]
+            intra = nn.eq(nn)
+            extra = nn.ne(nn1)
+            assert np.all(np.diff(distances[i, intra]) >= 0)
+            assert np.all(np.diff(distances[i, extra]) >= 0)
+            N2[i] = distances[i, intra][1] / max(distances[i, extra][1], 1e-15)
+        return 1 - 1 / (N2 + 1)
+
+###################################################################################################################################
+
+    def class_likeliood_diff_adjusted(self) -> np.ndarray:
+        r"""
+        Class Likelihood Difference (CLD) takes the difference between the likelihood of :math:`\mathbf x_i` in
+        relation to its class and the maximum likelihood it has to any other class.
+
+        .. math::
+
+            CLD(\mathbf x_i) = \frac{1 -\left (P(\mathbf x_i|y_i)P(y_i) - \max_{y_j \neq y_i}
+            [P(\mathbf x_i |y_j)P(y_j)]\right )}{2}
+
+        The difference in the class likelihood is larger for easier instances, because the confidence it belongs to its
+        class is larger than that of any other class. We take the complement of the measure as indicated in the
+        equation above.
+
+        Returns:
+            array-like: :math:`CLD(\mathbf x_i)`
+        """
+        data = self.data.copy()
+        proba = self.calibrated_nb.predict_proba(self.X)
+        array_of_lists = np.array(proba)
+
+        max_indices = np.argsort(array_of_lists, axis=1)[:, -2:]
+        largest_values = array_of_lists[np.arange(array_of_lists.shape[0])[:, None], max_indices]
+        subtraction_result = (largest_values[:, 0] - largest_values[:, 1]) * (-1)
+
+        resultados = subtraction_result.reshape(-1)
+
+        return (1 - np.array(resultados)) / 2
+
+###################################################################################################################################
+
+    def disjunct_class_percentage_adjusted(self,target_col=None,target_col2=None,ccp_alpha=None,ccp_alpha2=None) -> np.ndarray:
+        r"""
+        Disjunct Class Percentage (DCP) builds a decision tree using :math:`\mathcal{D}` and considers the percentage
+        of instances in the disjunct of :math:`\mathbf x_i` which share the same label as :math:`\mathbf x_i`.
+        The disjunct of an example corresponds to the leaf node where it is classified by the decision tree.
+
+        .. math::
+
+            DCP(\mathbf x_i) = 1- \frac{\sharp\{\mathbf x_j | \mathbf x_j \in Disjunct(\mathbf x_i) \wedge y_j = y_i\}}
+            {\sharp\{\mathbf x_j|\mathbf x_j \in Disjunct(\mathbf x_i)\}}
+
+        Returns:
+            array-like: :math:`DCP(\mathbf x_i)`
+        """
+        data = self.data.copy()
+        seed = np.random.seed(55)
+
+        for i, row in data.iterrows():
+          df_inter = data.copy()
+          #test_sample = row.to_frame().T
+          train_sample = data.drop(i)
+
+          #rodar a árvore para estimar y e os parâmetros (gridsearch)
+          if target_col is None:
+            target_col = train_sample.columns[-1]
+            y = train_sample.iloc[:, -1]
+          else:
+            target_col = target_col
+            y = train_sample[target_col]
+          train_sample = train_sample.reset_index(drop=True)
+          X = train_sample.drop(columns=target_col)
+
+          # Decision Tree Classifier Pruned
+          if ccp_alpha is None:
+            parameters = {'ccp_alpha': np.linspace(0.001, 0.1, num=100)}
+            dtc = tree.DecisionTreeClassifier(criterion='gini', random_state=seed)
+            clf = GridSearchCV(dtc, parameters, n_jobs=-1)
+            clf.fit(X.values, y.values)
+            ccp_alpha = clf.best_params_['ccp_alpha']
+
+          dtc_pruned = tree.DecisionTreeClassifier(criterion='gini', ccp_alpha=ccp_alpha, random_state=seed)
+          dtc_pruned = dtc_pruned.fit(X.values, y.values)
+
+          test_sample = data.iloc[i,:-1].to_frame().T
+          test_sample['target'] = dtc_pruned.predict(test_sample)
+
+          df_inter.loc[i] = test_sample.iloc[0]
+          df_dcp = df_inter # Adicionar o DataFrame à lista
+
+          #Decision Tree Classifier Pruned
+          if target_col2 is None:
+            target_col2 = df_dcp.columns[-1]
+            y2 = df_dcp.iloc[:, -1]
+          else:
+            target_col2 = target_col2
+            y2 = df_dcp[target_col2]
+          df_dcp = df_dcp.reset_index(drop=True)
+          X2 = df_dcp.drop(columns=target_col2)
+
+          if ccp_alpha2 is None:
+              parameters = {'ccp_alpha': np.linspace(0.001, 0.1, num=100)}
+              dtc2 = tree.DecisionTreeClassifier(criterion='gini', random_state=seed)
+              clf2 = GridSearchCV(dtc2, parameters, n_jobs=-1)
+              clf2.fit(X2.values, y2.values)
+              ccp_alpha2 = clf2.best_params_['ccp_alpha']
+
+          dtc_pruned2 = tree.DecisionTreeClassifier(criterion='gini', ccp_alpha=ccp_alpha2, random_state=seed)
+          dtc_pruned2 = dtc_pruned2.fit(X2.values, y2.values)
+
+          df_dcp['leaf_id'] = dtc_pruned2.apply(X2.values)
+
+          unique_values2 = pd.unique(y2)
+          C2 = [[] for _ in unique_values2]
+          vl_unico2 = sorted(unique_values2.tolist())
+
+          for j in vl_unico2:
+              for index, row in df_dcp.iterrows():
+                df_leaf = df_dcp[df_dcp['leaf_id'] == row['leaf_id']]
+                if row['target'] == vl_unico2[j]:
+                  C2[j].append(len(df_leaf[df_leaf['target'] == row['target']]) / len(df_leaf))
+                else:
+                  C2[j].append(len(df_leaf[df_leaf['target'] == vl_unico2[j]]) / len(df_leaf))
+
+          DCPadj = []
+          for n in range(len(C2[0])):
+            entropy = 0.0
+            p = [c2[n] for c2 in C2]
+            entropy -= sum(p * math.log2(p) if p > 0 else 0 for p in p)
+            DCPadj.append(entropy)
+        return DCPadj
+
+###################################################################################################################################
+
+    def tree_depth_unpruned_adjusted(self,target_col=None,target_col2=None) -> np.ndarray:
+        r"""
+        Tree Depth (TD) returns the depth of the leaf node that classifies :math:`\mathbf x_i` in a  decision tree,
+        normalized by the maximum depth of the tree built from :math:`D`:
+
+        .. math::
+
+            TD(\mathbf x_i) = \frac{depth(\mathbf x_i)}{\max(depth(D))}
+
+        There are two versions of this measure, using pruned (:math:`TD_P(\mathbf x_i)`)
+        and unpruned (:math:`TD_U(\mathbf x_i)`) decision trees. Instances harder to classify tend to be placed
+        at deeper levels of the trees and present higher :math:`TD` values.
+
+        Returns:
+            array-like: :math:`TD_U(\mathbf x_i)`
+        """
+        data = self.data.copy()
+        seed = np.random.seed(55)
+
+        for i, row in data.iterrows():
+          df_inter = data.copy()
+          train_sample = data.drop(i)
+
+          if target_col is None:
+            target_col = train_sample.columns[-1]
+            y = train_sample.iloc[:, -1]
+          else:
+            target_col = target_col
+            y = train_sample[target_col]
+          train_sample = train_sample.reset_index(drop=True)
+          X = train_sample.drop(columns=target_col)
+
+          # Decision Tree Classifier
+          dtc = tree.DecisionTreeClassifier(min_samples_split=2, criterion='gini', random_state=seed)
+          dtc = dtc.fit(X.values, y.values)
+
+          test_sample = data.iloc[i,:-1].to_frame().T
+          test_sample['target'] = dtc.predict(test_sample)
+
+          df_inter.loc[i] = test_sample.iloc[0] 
+          df_ds = df_inter 
+
+          #Decision Tree Classifier
+          if target_col2 is None:
+            target_col2 = df_ds.columns[-1]
+            y2 = df_ds.iloc[:, -1]
+          else:
+            target_col2 = target_col2
+            y2 = df_ds[target_col2]
+          df_ds = df_ds.reset_index(drop=True)
+          X2 = df_ds.drop(columns=target_col2)
+
+          dtc2 = tree.DecisionTreeClassifier(min_samples_split=2, criterion='gini', random_state=seed)
+          dtc2 = dtc2.fit(X2.values, y2.values)
+
+        TDUadj = X2.apply(lambda x: dtc2.decision_path([x]).sum() - 1, axis=1, raw=True).values / dtc2.get_depth()
+
+        return TDUadj
+
+###################################################################################################################################
+
+    def tree_depth_pruned_adjusted(self,target_col=None,target_col2=None,ccp_alpha=None,ccp_alpha2=None) -> np.ndarray:
+        r"""
+        Tree Depth (TD) returns the depth of the leaf node that classifies :math:`\mathbf x_i` in a  decision tree,
+        normalized by the maximum depth of the tree built from :math:`D`:
+
+        .. math::
+
+            TD(\mathbf x_i) = \frac{depth(\mathbf x_i)}{\max(depth(D))}
+
+        There are two versions of this measure, using pruned (:math:`TD_P(\mathbf x_i)`)
+        and unpruned (:math:`TD_U(\mathbf x_i)`) decision trees. Instances harder to classify tend to be placed
+        at deeper levels of the trees and present higher :math:`TD` values.
+
+        Returns:
+            array-like: :math:`TD_P(\mathbf x_i)`
+        """
+
+        data = self.data.copy()
+        seed = np.random.seed(55)
+
+        for i, row in data.iterrows():
+          df_inter = data.copy()
+          #test_sample = row.to_frame().T
+          train_sample = data.drop(i)
+
+          if target_col is None:
+            target_col = train_sample.columns[-1]
+            y = train_sample.iloc[:, -1]
+          else:
+            target_col = target_col
+            y = train_sample[target_col]
+          train_sample = train_sample.reset_index(drop=True)
+          X = train_sample.drop(columns=target_col)
+
+          # Decision Tree Classifier Pruned
+          if ccp_alpha is None:
+            parameters = {'ccp_alpha': np.linspace(0.001, 0.1, num=100)}
+            dtc = tree.DecisionTreeClassifier(criterion='gini', random_state=seed)
+            clf = GridSearchCV(dtc, parameters, n_jobs=-1)
+            clf.fit(X.values, y.values)
+            ccp_alpha = clf.best_params_['ccp_alpha']
+
+          dtc_pruned = tree.DecisionTreeClassifier(criterion='gini', ccp_alpha=ccp_alpha, random_state=seed)
+          dtc_pruned = dtc_pruned.fit(X.values, y.values)
+
+          test_sample = data.iloc[i,:-1].to_frame().T
+          test_sample['target'] = dtc_pruned.predict(test_sample)
+
+          df_inter.loc[i] = test_sample.iloc[0] 
+          df_dcp = df_inter # Adicionar o DataFrame à lista
+
+          #Decision Tree Classifier Pruned
+          if target_col2 is None:
+            target_col2 = df_dcp.columns[-1]
+            y2 = df_dcp.iloc[:, -1]
+          else:
+            target_col2 = target_col2
+            y2 = df_dcp[target_col2]
+          df_dcp = df_dcp.reset_index(drop=True)
+          X2 = df_dcp.drop(columns=target_col2)
+
+          if ccp_alpha2 is None:
+              parameters = {'ccp_alpha': np.linspace(0.001, 0.1, num=100)}
+              dtc2 = tree.DecisionTreeClassifier(criterion='gini', random_state=seed)
+              clf2 = GridSearchCV(dtc2, parameters, n_jobs=-1)
+              clf2.fit(X2.values, y2.values)
+              ccp_alpha2 = clf2.best_params_['ccp_alpha']
+
+          dtc_pruned2 = tree.DecisionTreeClassifier(criterion='gini', ccp_alpha=ccp_alpha2, random_state=seed)
+          dtc_pruned2 = dtc_pruned2.fit(X2.values, y2.values)
+
+        TDPadj = X2.apply(lambda x: dtc_pruned2.decision_path([x]).sum() - 1, axis=1, raw=True).values / dtc_pruned2.get_depth()
+
+        return TDPadj
